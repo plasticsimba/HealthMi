@@ -1,0 +1,103 @@
+name: iOS CI
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+      - codex/cloud-build-validation
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    name: Test and build unsigned app
+    runs-on: macos-26
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Show build environment
+        run: |
+          set -euo pipefail
+          uname -m
+          xcodebuild -version
+          xcrun simctl list runtimes
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Select an available iPhone Simulator
+        id: simulator
+        run: |
+          set -euo pipefail
+          simulator_udid="$({ xcrun simctl list devices available -j; } | python3 -c '
+          import json, sys
+          data = json.load(sys.stdin)
+          for runtime, devices in data["devices"].items():
+              for device in devices:
+                  if device.get("isAvailable") and device.get("name", "").startswith("iPhone"):
+                      print(device["udid"])
+                      raise SystemExit(0)
+          raise SystemExit("No available iPhone Simulator found")
+          ')"
+          echo "udid=$simulator_udid" >> "$GITHUB_OUTPUT"
+          xcrun simctl boot "$simulator_udid" || true
+          xcrun simctl bootstatus "$simulator_udid" -b
+
+      - name: Run unit tests
+        run: |
+          set -euo pipefail
+          xcodebuild test \
+            -project HealthMi.xcodeproj \
+            -scheme HealthMi \
+            -destination "platform=iOS Simulator,id=${{ steps.simulator.outputs.udid }}" \
+            -derivedDataPath build/TestDerivedData \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Build unsigned device app
+        run: |
+          set -euo pipefail
+          xcodebuild build \
+            -project HealthMi.xcodeproj \
+            -scheme HealthMi \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/DeviceDerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=''
+
+      - name: Package unsigned artifact
+        run: |
+          set -euo pipefail
+          app_path="build/DeviceDerivedData/Build/Products/Release-iphoneos/HealthMi.app"
+          test -d "$app_path"
+          test ! -e "$app_path/embedded.mobileprovision"
+          test ! -e "$app_path/_CodeSignature"
+          mkdir -p build/unsigned/Payload
+          cp -R "$app_path" build/unsigned/Payload/HealthMi.app
+          printf '%s\n' \
+            'UNSIGNED BUILD — not installable until locally signed.' \
+            'No private signing data, account data, or health data is included.' \
+            > build/unsigned/README.txt
+          (
+            cd build/unsigned
+            zip -qry ../HealthMi-unsigned.ipa Payload README.txt
+          )
+
+      - name: Upload unsigned build
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: HealthMi-unsigned-do-not-install
+          path: build/HealthMi-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 7
